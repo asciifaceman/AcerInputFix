@@ -16,10 +16,12 @@ $Trigger = New-ScheduledTaskTrigger `
     -AtLogOn `
     -User $User
 
+# Highest is required for automatic Col07 disable/enable (Layer-2 taskbar
+# repair). Limited still gets Layer-1 B0 suppression only.
 $Principal = New-ScheduledTaskPrincipal `
     -UserId $User `
     -LogonType Interactive `
-    -RunLevel Limited
+    -RunLevel Highest
 
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -33,9 +35,10 @@ Register-ScheduledTask `
     -Trigger $Trigger `
     -Principal $Principal `
     -Settings $Settings `
-    -Description "Work around Acer stuck VK_MEDIA_NEXT_TRACK input state." `
+    -Description "Work around Acer stuck VK_MEDIA_NEXT_TRACK / Col07 input state." `
     -Force
 
 Write-Host ""
-Write-Host "AcerInputFix startup task installed."
-Write-Host "It will start automatically when $User signs in."
+Write-Host "AcerInputFix startup task installed (RunLevel Highest)."
+Write-Host "It will start elevated when $User signs in (UAC consent may apply once at install)."
+Write-Host "Layer-1: suppress stuck VK_MEDIA_NEXT_TRACK. Layer-2: auto Col07 reset after each repair."

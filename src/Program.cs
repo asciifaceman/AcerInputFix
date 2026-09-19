@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Windows.Forms;
 
@@ -26,13 +27,11 @@ internal static class Program
 
 internal sealed class TrayContext : ApplicationContext
 {
-    // From our captured failure:
-    //
-    // VK_MEDIA_NEXT_TRACK receives DOWN without UP.
-    // Windows begins repeating it after its normal typematic delay.
-    //
-    // Normal taps should release well before this.
+    // Quarantine window for injected Next Track before classifying Acer fault.
     private const int StuckTimeoutMs = 350;
+
+    // Avoid disable/enable thrash if repairs fire again right after a cycle.
+    private const int Col07AutoCycleCooldownMs = 8000;
 
     private const int WH_KEYBOARD_LL = 13;
 
@@ -42,13 +41,15 @@ internal sealed class TrayContext : ApplicationContext
     private const int WM_SYSKEYUP = 0x0105;
 
     private const uint VK_MEDIA_NEXT_TRACK = 0xB0;
+    private const uint VK_MEDIA_PREV_TRACK = 0xB1;
+    private const uint VK_MEDIA_PLAY_PAUSE = 0xB3;
 
     private const uint LLKHF_INJECTED = 0x10;
 
     private const uint INPUT_KEYBOARD = 1;
     private const uint KEYEVENTF_KEYUP = 0x0002;
 
-    // Lets our hook distinguish our own corrective input.
+    // Lets our hook distinguish input replayed by this app.
     private static readonly UIntPtr OurExtraInfo =
         new UIntPtr(0x41434658); // "ACFX"
 
@@ -60,11 +61,15 @@ internal sealed class TrayContext : ApplicationContext
     private readonly ToolStripMenuItem _totalRepairsItem;
     private readonly ToolStripMenuItem _lastRepairItem;
     private readonly ToolStripMenuItem _enabledItem;
+    private readonly ToolStripMenuItem _autoResetCol07Item;
+    private readonly ToolStripMenuItem _diagnosticsItem;
 
     private readonly object _stateLock = new();
     private readonly object _logLock = new();
 
     private readonly System.Threading.Timer _stuckTimer;
+    private readonly DiagnosticsMonitor _diagnostics;
+    private readonly bool _isElevated;
 
     private LowLevelKeyboardProc? _hookProc;
     private IntPtr _hook = IntPtr.Zero;
@@ -72,8 +77,11 @@ internal sealed class TrayContext : ApplicationContext
     private bool _nextTrackPending;
     private bool _suppressBogusNextTrack;
     private bool _enabled = true;
+    private bool _autoResetCol07 = true;
 
     private long _runRepairs;
+    private long _lastCol07CycleTick;
+    private int _col07CycleInProgress;
     private Stats _stats;
 
     private readonly string _baseDir;
@@ -87,6 +95,8 @@ internal sealed class TrayContext : ApplicationContext
         _statsPath = Path.Combine(_baseDir, "stats.json");
 
         _stats = LoadStats();
+        _autoResetCol07 = _stats.AutoResetCol07;
+        _isElevated = IsProcessElevated();
 
         RotateLogIfNeeded();
         Log("AcerInputFix starting.");
@@ -94,6 +104,23 @@ internal sealed class TrayContext : ApplicationContext
             $"Interop sizes: INPUT={Marshal.SizeOf<INPUT>()}, " +
             $"KEYBDINPUT={Marshal.SizeOf<KEYBDINPUT>()}"
         );
+        Log(
+            $"Elevation: {(_isElevated ? "Administrator" : "Limited")}  " +
+            $"AutoResetCol07: {_autoResetCol07}"
+        );
+
+        if (_autoResetCol07 && !_isElevated)
+        {
+            Log(
+                "WARNING: Auto-reset Col07 is on but this process is not " +
+                "elevated. Layer-1 B0 suppression still works; Layer-2 " +
+                "taskbar repair via Col07 cycle will be skipped until " +
+                "AcerInputFix runs as Administrator " +
+                "(see Install-StartupTask.ps1 RunLevel)."
+            );
+        }
+
+        _diagnostics = new DiagnosticsMonitor(Log);
 
         _stuckTimer = new System.Threading.Timer(
             StuckTimerExpired,
@@ -158,6 +185,55 @@ internal sealed class TrayContext : ApplicationContext
             RefreshMenu();
         };
 
+        _autoResetCol07Item = new ToolStripMenuItem(
+            "Auto-reset Col07 on repair"
+        )
+        {
+            Checked = _autoResetCol07,
+            CheckOnClick = true
+        };
+
+        _autoResetCol07Item.CheckedChanged += (_, _) =>
+        {
+            _autoResetCol07 = _autoResetCol07Item.Checked;
+
+            lock (_stateLock)
+            {
+                _stats.AutoResetCol07 = _autoResetCol07;
+                SaveStats();
+            }
+
+            Log(
+                _autoResetCol07
+                    ? "Auto-reset Col07 enabled."
+                    : "Auto-reset Col07 disabled."
+            );
+
+            if (_autoResetCol07 && !_isElevated)
+            {
+                Log(
+                    "WARNING: Auto-reset Col07 needs Administrator. " +
+                    "B0 suppression continues; Col07 cycles will be skipped."
+                );
+            }
+
+            RefreshMenu();
+        };
+
+        _diagnosticsItem = new ToolStripMenuItem(
+            "Layer-2 diagnostics"
+        )
+        {
+            Checked = false,
+            CheckOnClick = true
+        };
+
+        _diagnosticsItem.CheckedChanged += (_, _) =>
+        {
+            _diagnostics.SetEnabled(_diagnosticsItem.Checked);
+            RefreshMenu();
+        };
+
         var openLogItem = new ToolStripMenuItem("Open log");
         openLogItem.Click += (_, _) =>
         {
@@ -193,6 +269,108 @@ internal sealed class TrayContext : ApplicationContext
         _menu.Items.Add(new ToolStripSeparator());
 
         _menu.Items.Add(_enabledItem);
+        _menu.Items.Add(_autoResetCol07Item);
+        _menu.Items.Add(_diagnosticsItem);
+
+        _menu.Items.Add(new ToolStripSeparator());
+
+        var markBrokenItem = new ToolStripMenuItem(
+            "DIAG: Mark taskbar previews broken"
+        );
+
+        markBrokenItem.Click += (_, _) =>
+        {
+            Log(
+                $"DIAG MARK: taskbar previews BROKEN " +
+                $"(B0 suppress active={IsB0SuppressActive()})"
+            );
+        };
+
+        var markRecoveredItem = new ToolStripMenuItem(
+            "DIAG: Mark taskbar previews recovered"
+        );
+
+        markRecoveredItem.Click += (_, _) =>
+        {
+            Log(
+                $"DIAG MARK: taskbar previews RECOVERED " +
+                $"(B0 suppress active={IsB0SuppressActive()})"
+            );
+        };
+
+        var testPreviousTrackResetItem =
+            new ToolStripMenuItem("Test synthetic Previous Track");
+
+        testPreviousTrackResetItem.Click += (_, _) =>
+        {
+            _diagnostics.Mark(
+                "about to send synthetic VK_MEDIA_PREV_TRACK"
+            );
+
+            if (SendSyntheticMediaTap(VK_MEDIA_PREV_TRACK))
+            {
+                Log(
+                    "TEST: Sent synthetic VK_MEDIA_PREV_TRACK " +
+                    "DOWN+UP reset sequence."
+                );
+
+                _diagnostics.Mark(
+                    "synthetic VK_MEDIA_PREV_TRACK completed"
+                );
+            }
+            else
+            {
+                int error = Marshal.GetLastWin32Error();
+
+                Log(
+                    $"ERROR: Synthetic Previous Track reset failed. " +
+                    $"Win32 error {error}."
+                );
+            }
+        };
+
+        var testPlayPauseResetItem =
+            new ToolStripMenuItem("Test synthetic Play/Pause");
+
+        testPlayPauseResetItem.Click += (_, _) =>
+        {
+            _diagnostics.Mark(
+                "about to send synthetic VK_MEDIA_PLAY_PAUSE"
+            );
+
+            if (SendSyntheticMediaTap(VK_MEDIA_PLAY_PAUSE))
+            {
+                Log(
+                    "TEST: Sent synthetic VK_MEDIA_PLAY_PAUSE " +
+                    "DOWN+UP reset sequence."
+                );
+
+                _diagnostics.Mark(
+                    "synthetic VK_MEDIA_PLAY_PAUSE completed"
+                );
+            }
+            else
+            {
+                int error = Marshal.GetLastWin32Error();
+
+                Log(
+                    $"ERROR: Synthetic Play/Pause reset failed. " +
+                    $"Win32 error {error}."
+                );
+            }
+        };
+
+        var cycleCol07Item = new ToolStripMenuItem(
+            "DIAG: Cycle Col07 (disable/enable)"
+        );
+
+        cycleCol07Item.Click += (_, _) => CycleCol07Diagnostic();
+
+        _menu.Items.Add(markBrokenItem);
+        _menu.Items.Add(markRecoveredItem);
+        _menu.Items.Add(testPreviousTrackResetItem);
+        _menu.Items.Add(testPlayPauseResetItem);
+        _menu.Items.Add(cycleCol07Item);
 
         _menu.Items.Add(new ToolStripSeparator());
 
@@ -203,7 +381,14 @@ internal sealed class TrayContext : ApplicationContext
 
         _menu.Items.Add(exitItem);
 
-        _menu.Opening += (_, _) => RefreshMenu();
+        _menu.Opening += (_, _) =>
+        {
+            RefreshMenu();
+            Log(
+                $"DIAG MARK: tray menu opened " +
+                $"(B0 suppress active={IsB0SuppressActive()})"
+            );
+        };
 
         _trayIcon = new NotifyIcon
         {
@@ -277,7 +462,7 @@ internal sealed class TrayContext : ApplicationContext
         var data =
             Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
 
-        // Always allow the corrective KEYUP generated by this app.
+        // Events replayed by this app must be allowed through untouched.
         if (data.dwExtraInfo == OurExtraInfo)
         {
             return CallNextHookEx(
@@ -308,12 +493,12 @@ internal sealed class TrayContext : ApplicationContext
             isInjected &&
             isNextTrack)
         {
+            bool replayLegitimateTap = false;
+
             lock (_stateLock)
             {
-                // Once the watchdog has identified a stuck B0, do not
-                // allow the continuing injected repeat stream to reach
-                // applications. The timer sends one synthetic KEYUP to
-                // release the original DOWN that already got through.
+                // If we already classified this as the Acer fault, swallow
+                // the entire remaining B0 stream until its real UP arrives.
                 if (_suppressBogusNextTrack)
                 {
                     if (isUp)
@@ -329,15 +514,55 @@ internal sealed class TrayContext : ApplicationContext
 
                     return new IntPtr(1);
                 }
+
+                if (isDown)
+                {
+                    // First injected B0 DOWN: quarantine it. Do not let
+                    // Explorer or applications see it yet.
+                    if (!_nextTrackPending)
+                    {
+                        _nextTrackPending = true;
+
+                        _stuckTimer.Change(
+                            StuckTimeoutMs,
+                            Timeout.Infinite
+                        );
+                    }
+
+                    // Suppress the initial DOWN and any repeat DOWNs that
+                    // arrive while we decide whether this is legitimate.
+                    return new IntPtr(1);
+                }
+
+                if (isUp && _nextTrackPending)
+                {
+                    // A matching UP arrived quickly enough to be a real
+                    // Next Track tap. Suppress the original UP too, then
+                    // replay one clean DOWN+UP sequence outside the lock.
+                    _nextTrackPending = false;
+
+                    _stuckTimer.Change(
+                        Timeout.Infinite,
+                        Timeout.Infinite
+                    );
+
+                    replayLegitimateTap = true;
+                }
             }
 
-            if (isDown)
+            if (replayLegitimateTap)
             {
-                HandleNextTrackDown();
-            }
-            else if (isUp)
-            {
-                HandleNextTrackUp();
+                if (!SendSyntheticMediaTap(VK_MEDIA_NEXT_TRACK))
+                {
+                    int error = Marshal.GetLastWin32Error();
+
+                    Log(
+                        $"ERROR: Could not replay legitimate " +
+                        $"VK_MEDIA_NEXT_TRACK tap. Win32 error {error}."
+                    );
+                }
+
+                return new IntPtr(1);
             }
         }
 
@@ -347,43 +572,6 @@ internal sealed class TrayContext : ApplicationContext
             wParam,
             lParam
         );
-    }
-
-    private void HandleNextTrackDown()
-    {
-        lock (_stateLock)
-        {
-            // First DOWN starts the watchdog.
-            //
-            // Repeated DOWN events do not extend the timer. If it
-            // really is stuck, we want to release based on the
-            // original DOWN.
-            if (!_nextTrackPending)
-            {
-                _nextTrackPending = true;
-
-                _stuckTimer.Change(
-                    StuckTimeoutMs,
-                    Timeout.Infinite
-                );
-            }
-        }
-    }
-
-    private void HandleNextTrackUp()
-    {
-        lock (_stateLock)
-        {
-            if (!_nextTrackPending)
-                return;
-
-            _nextTrackPending = false;
-
-            _stuckTimer.Change(
-                Timeout.Infinite,
-                Timeout.Infinite
-            );
-        }
     }
 
     private void StuckTimerExpired(object? state)
@@ -399,50 +587,177 @@ internal sealed class TrayContext : ApplicationContext
                 return;
             }
 
-            // The initial B0 DOWN has been held longer than a normal tap.
-            // Mark the stream as bogus before generating the release so
-            // every later injected B0 repeat will be swallowed.
-            _suppressBogusNextTrack = true;
+            // No matching UP arrived within the quarantine window.
+            // The original DOWN never reached Windows, so there is nothing
+            // to release downstream. Keep swallowing this injected B0
+            // stream until Acer eventually emits its real UP.
             _nextTrackPending = false;
+            _suppressBogusNextTrack = true;
         }
 
-        if (SendNextTrackKeyUp())
+        long runCount =
+            Interlocked.Increment(ref _runRepairs);
+
+        lock (_stateLock)
         {
-            long runCount =
-                Interlocked.Increment(ref _runRepairs);
+            _stats.TotalRepairs++;
+            _stats.LastRepair = DateTimeOffset.Now;
 
-            lock (_stateLock)
-            {
-                _stats.TotalRepairs++;
-                _stats.LastRepair = DateTimeOffset.Now;
-
-                SaveStats();
-            }
-
-            Log(
-                $"REPAIR #{runCount}: " +
-                $"VK_MEDIA_NEXT_TRACK remained down for " +
-                $"{StuckTimeoutMs} ms; sent corrective KEYUP and " +
-                $"started suppressing the bogus repeat stream."
-            );
+            SaveStats();
         }
-        else
+
+        Log(
+            $"REPAIR #{runCount}: " +
+            $"Quarantined stuck VK_MEDIA_NEXT_TRACK after " +
+            $"{StuckTimeoutMs} ms; suppressing bogus stream " +
+            $"before it reaches Windows."
+        );
+
+        Log(
+            $"DIAG MARK: REPAIR #{runCount} classified Acer B0 fault " +
+            "(quarantine/suppression active)"
+        );
+
+        if (_autoResetCol07)
         {
-            lock (_stateLock)
-            {
-                _suppressBogusNextTrack = false;
-            }
-
-            int error = Marshal.GetLastWin32Error();
-
-            Log(
-                $"ERROR: SendInput corrective KEYUP failed. " +
-                $"Win32 error {error}."
+            // Layer-1 is already handled (B0 swallowed). Reset Col07 so
+            // Layer-2 taskbar/preview state can recover without a physical key.
+            RequestCol07Cycle(
+                reason: $"auto after REPAIR #{runCount}",
+                interactiveConfirm: false
             );
         }
     }
 
-    private static bool SendNextTrackKeyUp()
+    private bool IsB0SuppressActive()
+    {
+        lock (_stateLock)
+            return _suppressBogusNextTrack || _nextTrackPending;
+    }
+
+    private void CycleCol07Diagnostic()
+    {
+        RequestCol07Cycle(
+            reason: "manual tray action",
+            interactiveConfirm: true
+        );
+    }
+
+    private void RequestCol07Cycle(
+        string reason,
+        bool interactiveConfirm)
+    {
+        if (interactiveConfirm)
+        {
+            var confirm = MessageBox.Show(
+                "Temporarily disable then re-enable the Acer Col07 " +
+                "consumer-control HID device?\n\n" +
+                "Volume, brightness, and media keys will stop working " +
+                "for about one second.\n\n" +
+                "This usually requires running AcerInputFix as Administrator.",
+                "AcerInputFix — Cycle Col07",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning
+            );
+
+            if (confirm != DialogResult.OK)
+            {
+                Log("DIAG Col07: Cycle cancelled by user.");
+                return;
+            }
+        }
+
+        if (!_isElevated)
+        {
+            Log(
+                $"DIAG Col07: Cycle skipped ({reason}) — not elevated. " +
+                "Restart as Administrator for Layer-2 Col07 reset."
+            );
+            return;
+        }
+
+        if (Interlocked.CompareExchange(
+                ref _col07CycleInProgress, 1, 0) != 0)
+        {
+            Log(
+                $"DIAG Col07: Cycle skipped ({reason}) — " +
+                "another cycle is already running."
+            );
+            return;
+        }
+
+        if (!interactiveConfirm)
+        {
+            long now = Environment.TickCount64;
+            long last = Interlocked.Read(ref _lastCol07CycleTick);
+
+            if (last != 0 &&
+                now - last < Col07AutoCycleCooldownMs)
+            {
+                Interlocked.Exchange(ref _col07CycleInProgress, 0);
+
+                Log(
+                    $"DIAG Col07: Auto-reset skipped ({reason}) — " +
+                    $"cooldown {Col07AutoCycleCooldownMs} ms " +
+                    $"(B0 suppress still active={IsB0SuppressActive()})."
+                );
+                return;
+            }
+        }
+
+        bool suppressBefore = IsB0SuppressActive();
+
+        Log(
+            $"DIAG MARK: Col07 cycle START reason={reason} " +
+            $"(B0 suppress active={suppressBefore})"
+        );
+
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            bool ok = false;
+
+            try
+            {
+                ok = Col07DeviceControl.TryCycle(Log, settleMs: 750);
+            }
+            catch (Exception ex)
+            {
+                Log($"DIAG Col07: Cycle threw: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(
+                    ref _lastCol07CycleTick,
+                    Environment.TickCount64
+                );
+                Interlocked.Exchange(ref _col07CycleInProgress, 0);
+            }
+
+            bool suppressAfter = IsB0SuppressActive();
+
+            Log(
+                $"DIAG MARK: Col07 cycle END ok={ok} reason={reason} " +
+                $"(B0 suppress active={suppressAfter})"
+            );
+
+            if (!ok)
+            {
+                Log(
+                    "DIAG Col07: Cycle failed — see earlier log lines. " +
+                    "If Win32 5, restart elevated and retry."
+                );
+            }
+        });
+    }
+
+    private static bool IsProcessElevated()
+    {
+        using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+        var principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static bool SendSyntheticMediaTap(uint virtualKey)
     {
         INPUT[] inputs =
         [
@@ -453,7 +768,22 @@ internal sealed class TrayContext : ApplicationContext
                 {
                     ki = new KEYBDINPUT
                     {
-                        wVk = (ushort)VK_MEDIA_NEXT_TRACK,
+                        wVk = (ushort)virtualKey,
+                        wScan = 0,
+                        dwFlags = 0,
+                        time = 0,
+                        dwExtraInfo = OurExtraInfo
+                    }
+                }
+            },
+            new INPUT
+            {
+                type = INPUT_KEYBOARD,
+                U = new InputUnion
+                {
+                    ki = new KEYBDINPUT
+                    {
+                        wVk = (ushort)virtualKey,
                         wScan = 0,
                         dwFlags = KEYEVENTF_KEYUP,
                         time = 0,
@@ -464,19 +794,24 @@ internal sealed class TrayContext : ApplicationContext
         ];
 
         uint sent = SendInput(
-            1,
+            (uint)inputs.Length,
             inputs,
             Marshal.SizeOf<INPUT>()
         );
 
-        return sent == 1;
+        return sent == inputs.Length;
     }
 
     private void RefreshMenu()
     {
+        string elevationNote =
+            _isElevated ? "" : " (needs Admin)";
+
         _statusItem.Text =
             _enabled
-                ? "Status: Active"
+                ? _autoResetCol07
+                    ? $"Status: Active + Col07 auto-reset{elevationNote}"
+                    : "Status: Active (B0 only)"
                 : "Status: Paused";
 
         _runRepairsItem.Text =
@@ -494,7 +829,9 @@ internal sealed class TrayContext : ApplicationContext
 
         _trayIcon.Text =
             _enabled
-                ? "Acer Input Fix - Active"
+                ? _autoResetCol07 && _isElevated
+                    ? "Acer Input Fix - Active + Col07 reset"
+                    : "Acer Input Fix - Active"
                 : "Acer Input Fix - Paused";
     }
 
@@ -518,9 +855,22 @@ internal sealed class TrayContext : ApplicationContext
             string json =
                 File.ReadAllText(_statsPath);
 
-            return
+            Stats stats =
                 JsonSerializer.Deserialize<Stats>(json)
                 ?? new Stats();
+
+            // Old stats.json files omit AutoResetCol07; default that to on.
+            using (JsonDocument doc = JsonDocument.Parse(json))
+            {
+                if (!doc.RootElement.TryGetProperty(
+                        "AutoResetCol07",
+                        out _))
+                {
+                    stats.AutoResetCol07 = true;
+                }
+            }
+
+            return stats;
         }
         catch (Exception ex)
         {
@@ -645,6 +995,9 @@ internal sealed class TrayContext : ApplicationContext
             Timeout.Infinite
         );
 
+        _diagnostics.SetEnabled(false);
+        _diagnostics.Dispose();
+
         if (_hook != IntPtr.Zero)
         {
             UnhookWindowsHookEx(_hook);
@@ -661,6 +1014,7 @@ internal sealed class TrayContext : ApplicationContext
     {
         if (disposing)
         {
+            _diagnostics.Dispose();
             _stuckTimer.Dispose();
             _trayIcon.Dispose();
             _menu.Dispose();
@@ -674,6 +1028,8 @@ internal sealed class TrayContext : ApplicationContext
         public long TotalRepairs { get; set; }
 
         public DateTimeOffset? LastRepair { get; set; }
+
+        public bool AutoResetCol07 { get; set; } = true;
     }
 
     private delegate IntPtr LowLevelKeyboardProc(

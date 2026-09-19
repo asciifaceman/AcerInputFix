@@ -7,9 +7,9 @@ A small Windows tray utility that works around an Acer keyboard issue where `VK_
 
 ## AI Disclaimer
 
-I was personally affected by this issue after Acer replaced my mainboard, and it was debilitating making vscode/powershell unsuable, the win key not work, and other things unusable etc etc.
+This project was created after an Acer mainboard replacement exposed a keyboard issue that could make VS Code, PowerShell, the Windows key, and other input unreliable.
 
-I worked with AI Agents to track down the issue with a lot of event logging and had it put together this software as a workaround. I figured it might be helpful to others as well, AI created or not. I certainly wouldn't have been able to fix it on my own.
+AI agents were used to investigate the issue through event logging and help assemble this workaround. It may be useful to others experiencing similar behavior.
 
 ## Requirements
 
@@ -39,6 +39,8 @@ Start `AcerInputFix.exe`. It runs in the notification area and begins monitoring
 
 The utility is intentionally quiet when no stuck input is detected. A repair is recorded in the tray menu, log file, and lifetime `stats.json` counter.
 
+When running **as Administrator**, each repair can also auto-cycle the Acer Col07 consumer-control device (disable/enable) to restore taskbar previews. Toggle **Auto-reset Col07 on repair** in the tray menu. Re-run `Install-StartupTask.ps1` so the logon task uses `RunLevel Highest`.
+
 ## Start with Windows
 
 Place `AcerInputFix.exe` beside the PowerShell scripts, then run PowerShell as the signed-in user:
@@ -55,6 +57,10 @@ This registers an interactive scheduled task that starts the utility when that u
 ```
 
 The installer uses the executable next to `Install-StartupTask.ps1`; it does not require a fixed installation path.
+
+## Layer-2 diagnostics
+
+Optional logging for the remaining taskbar-preview investigation is documented in [DIAGNOSTICS.md](DIAGNOSTICS.md). Enable **Layer-2 diagnostics** from the tray menu; B0 quarantine/suppression is unchanged.
 
 ## Safety and limitations
 
