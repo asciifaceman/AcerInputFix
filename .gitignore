@@ -1,0 +1,22 @@
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.user
+*.suo
+
+# .NET build output
+[Bb]in/
+[Oo]bj/
+
+# Local publish and runtime files
+publish/
+*.exe
+*.pdb
+*.dll
+*.log
+*.old.log
+stats.json
+
+# Operating-system files
+.DS_Store
+Thumbs.db
