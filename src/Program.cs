@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text.Json;
@@ -6,11 +7,17 @@ using System.Windows.Forms;
 
 internal static class Program
 {
+    private const string TaskName = "AcerInputFix";
     private static Mutex? _mutex;
 
     [STAThread]
     static void Main()
     {
+        // Start Menu / Explorer launches are usually not elevated. Prefer the
+        // existing Highest logon task so Col07 reset works without a UAC prompt.
+        if (!IsProcessElevated() && TryRelaunchViaLogonTask())
+            return;
+
         _mutex = new Mutex(
             true,
             @"Local\AcerInputFix",
@@ -22,6 +29,51 @@ internal static class Program
 
         ApplicationConfiguration.Initialize();
         Application.Run(new TrayContext());
+    }
+
+    private static bool IsProcessElevated()
+    {
+        using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+        var principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static bool TryRelaunchViaLogonTask()
+    {
+        try
+        {
+            using var query = Process.Start(new ProcessStartInfo
+            {
+                FileName = "schtasks.exe",
+                Arguments = $"/Query /TN \"{TaskName}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            });
+
+            if (query is null)
+                return false;
+
+            query.WaitForExit(5000);
+            if (query.ExitCode != 0)
+                return false;
+
+            using var run = Process.Start(new ProcessStartInfo
+            {
+                FileName = "schtasks.exe",
+                Arguments = $"/Run /TN \"{TaskName}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+
+            run?.WaitForExit(5000);
+            return run is { ExitCode: 0 };
+        }
+        catch
+        {
+            return false;
+        }
     }
 }
 
@@ -84,22 +136,40 @@ internal sealed class TrayContext : ApplicationContext
     private int _col07CycleInProgress;
     private Stats _stats;
 
-    private readonly string _baseDir;
+    private readonly string _installDir;
+    private readonly string _dataDir;
     private readonly string _logPath;
     private readonly string _statsPath;
 
     public TrayContext()
     {
-        _baseDir = AppContext.BaseDirectory;
-        _logPath = Path.Combine(_baseDir, "AcerInputFix.log");
-        _statsPath = Path.Combine(_baseDir, "stats.json");
+        _installDir = AppContext.BaseDirectory.TrimEnd(
+            Path.DirectorySeparatorChar,
+            Path.AltDirectorySeparatorChar
+        );
+
+        _dataDir = Path.Combine(
+            Environment.GetFolderPath(
+                Environment.SpecialFolder.LocalApplicationData
+            ),
+            "AcerInputFix"
+        );
+
+        Directory.CreateDirectory(_dataDir);
+
+        _logPath = Path.Combine(_dataDir, "AcerInputFix.log");
+        _statsPath = Path.Combine(_dataDir, "stats.json");
+
+        TryMigrateLegacyDataFiles();
 
         _stats = LoadStats();
         _autoResetCol07 = _stats.AutoResetCol07;
         _isElevated = IsProcessElevated();
 
         RotateLogIfNeeded();
-        Log("AcerInputFix starting.");
+        Log($"AcerInputFix {GetAppVersion()} starting.");
+        Log($"Install dir: {_installDir}");
+        Log($"Data dir: {_dataDir}");
         Log(
             $"Interop sizes: INPUT={Marshal.SizeOf<INPUT>()}, " +
             $"KEYBDINPUT={Marshal.SizeOf<KEYBDINPUT>()}"
@@ -114,9 +184,9 @@ internal sealed class TrayContext : ApplicationContext
             Log(
                 "WARNING: Auto-reset Col07 is on but this process is not " +
                 "elevated. Layer-1 B0 suppression still works; Layer-2 " +
-                "taskbar repair via Col07 cycle will be skipped until " +
-                "AcerInputFix runs as Administrator " +
-                "(see Install-StartupTask.ps1 RunLevel)."
+                "taskbar repair via Col07 cycle will be skipped. " +
+                "Start via the AcerInputFix logon task or reinstall with " +
+                "the sign-in startup option enabled."
             );
         }
 
@@ -237,21 +307,34 @@ internal sealed class TrayContext : ApplicationContext
         var openLogItem = new ToolStripMenuItem("Open log");
         openLogItem.Click += (_, _) =>
         {
-            EnsureLogExists();
-
-            Process.Start(new ProcessStartInfo
+            try
             {
-                FileName = _logPath,
-                UseShellExecute = true
-            });
+                EnsureLogExists();
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = _logPath,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"Could not open the log file.\n\n{ex.Message}\n\n" +
+                    $"Expected path:\n{_logPath}",
+                    "AcerInputFix",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning
+                );
+            }
         };
 
-        var openFolderItem = new ToolStripMenuItem("Open folder");
+        var openFolderItem = new ToolStripMenuItem("Open data folder");
         openFolderItem.Click += (_, _) =>
         {
             Process.Start(new ProcessStartInfo
             {
-                FileName = _baseDir,
+                FileName = _dataDir,
                 UseShellExecute = true
             });
         };
@@ -750,6 +833,22 @@ internal sealed class TrayContext : ApplicationContext
         });
     }
 
+    private static string GetAppVersion()
+    {
+        var assembly = typeof(Program).Assembly;
+
+        string? informational =
+            assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+                ?.InformationalVersion;
+
+        if (!string.IsNullOrWhiteSpace(informational))
+            return informational;
+
+        Version? version = assembly.GetName().Version;
+        return version?.ToString() ?? "unknown";
+    }
+
     private static bool IsProcessElevated()
     {
         using WindowsIdentity identity = WindowsIdentity.GetCurrent();
@@ -908,10 +1007,40 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
+    private void TryMigrateLegacyDataFiles()
+    {
+        try
+        {
+            string legacyStats =
+                Path.Combine(_installDir, "stats.json");
+            string legacyLog =
+                Path.Combine(_installDir, "AcerInputFix.log");
+
+            if (!File.Exists(_statsPath) && File.Exists(legacyStats))
+                File.Copy(legacyStats, _statsPath);
+
+            if (!File.Exists(_logPath) && File.Exists(legacyLog))
+                File.Copy(legacyLog, _logPath);
+        }
+        catch
+        {
+            // Migration is best-effort (Program Files may be unreadable/unwritable).
+        }
+    }
+
     private void EnsureLogExists()
     {
-        if (!File.Exists(_logPath))
-            File.WriteAllText(_logPath, "");
+        try
+        {
+            Directory.CreateDirectory(_dataDir);
+
+            if (!File.Exists(_logPath))
+                File.WriteAllText(_logPath, "");
+        }
+        catch
+        {
+            // Never throw into tray click handlers.
+        }
     }
 
     private void RotateLogIfNeeded()
@@ -928,7 +1057,7 @@ internal sealed class TrayContext : ApplicationContext
 
             string old =
                 Path.Combine(
-                    _baseDir,
+                    _dataDir,
                     "AcerInputFix.old.log"
                 );
 
@@ -949,6 +1078,8 @@ internal sealed class TrayContext : ApplicationContext
         {
             try
             {
+                Directory.CreateDirectory(_dataDir);
+
                 File.AppendAllText(
                     _logPath,
                     $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz}  " +
@@ -966,11 +1097,17 @@ internal sealed class TrayContext : ApplicationContext
     {
         try
         {
-            File.AppendAllText(
-                Path.Combine(
-                    AppContext.BaseDirectory,
-                    "AcerInputFix.log"
+            string dataDir = Path.Combine(
+                Environment.GetFolderPath(
+                    Environment.SpecialFolder.LocalApplicationData
                 ),
+                "AcerInputFix"
+            );
+
+            Directory.CreateDirectory(dataDir);
+
+            File.AppendAllText(
+                Path.Combine(dataDir, "AcerInputFix.log"),
                 $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz}  " +
                 $"{message}{Environment.NewLine}"
             );

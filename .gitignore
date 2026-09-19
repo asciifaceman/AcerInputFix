@@ -10,6 +10,7 @@
 
 # Local publish and runtime files
 publish/
+artifacts/
 *.exe
 *.pdb
 *.dll
@@ -20,3 +21,6 @@ stats.json
 # Operating-system files
 .DS_Store
 Thumbs.db
+
+# User Added
+old/

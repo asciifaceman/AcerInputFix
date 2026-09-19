@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-win-x64:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Parse release version
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          $version = $tag.Trim()
+          if ($version.StartsWith("v") -or $version.StartsWith("V")) {
+            $version = $version.Substring(1)
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "Release tag '$tag' must look like v0.2.0 (got version '$version')."
+          }
+
+          $parts = $version.Split('.')
+          while ($parts.Length -lt 4) { $parts += '0' }
+          $fileVersion = [string]::Join('.', $parts[0..3])
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "file_version=$fileVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          Write-Host "Building release version $version (file $fileVersion) from tag $tag"
+
+      - name: Publish win-x64 single-file
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts/publish -Force | Out-Null
+          dotnet publish AcerInputFix.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            /p:PublishSingleFile=true `
+            /p:Version=${{ steps.ver.outputs.version }} `
+            /p:AssemblyVersion=${{ steps.ver.outputs.file_version }} `
+            /p:FileVersion=${{ steps.ver.outputs.file_version }} `
+            /p:InformationalVersion=${{ steps.ver.outputs.version }} `
+            -o artifacts/publish
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer wizard
+        shell: pwsh
+        run: |
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $iscc) {
+            throw "ISCC.exe not found after Inno Setup install."
+          }
+
+          New-Item -ItemType Directory -Path artifacts/installer -Force | Out-Null
+
+          & $iscc `
+            "/DMyAppVersion=${{ steps.ver.outputs.version }}" `
+            "installer\AcerInputFix.iss"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Hash installer
+        shell: pwsh
+        run: |
+          $version = "${{ steps.ver.outputs.version }}"
+          $setup = "artifacts/installer/AcerInputFix-$version-win-x64-setup.exe"
+          if (-not (Test-Path $setup)) {
+            throw "Installer not found at $setup"
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 $setup).Hash
+          $name = Split-Path $setup -Leaf
+          Set-Content -Path "$setup.sha256" -Value "$hash  $name" -Encoding ascii
+          Write-Host "Built $setup"
+          Write-Host "SHA256 $hash"
+
+      - name: Upload assets to GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${{ steps.ver.outputs.version }}"
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $setup = "artifacts/installer/AcerInputFix-$version-win-x64-setup.exe"
+          $sum = "$setup.sha256"
+
+          gh release upload $tag $setup $sum --clobber

@@ -7,8 +7,29 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
 
+    <AssemblyName>AcerInputFix</AssemblyName>
+    <RootNamespace>AcerInputFix</RootNamespace>
+    <Product>AcerInputFix</Product>
+    <AssemblyTitle>AcerInputFix — Acer HID Col07 input workaround</AssemblyTitle>
+    <Description>Workaround for Acer HID Col07 stuck media-key and taskbar input state</Description>
+    <Company>asciifaceman</Company>
+    <Authors>asciifaceman</Authors>
+    <Copyright>Copyright (c) 2026 asciifaceman</Copyright>
+    <RepositoryUrl>https://github.com/asciifaceman/AcerInputFix</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/asciifaceman/AcerInputFix</PackageProjectUrl>
+
+    <!-- Override on release builds: /p:Version=1.2.3 -->
+    <Version>0.2.0</Version>
+    <AssemblyVersion>0.2.0.0</AssemblyVersion>
+    <FileVersion>0.2.0.0</FileVersion>
+    <InformationalVersion>$(Version)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <DebugType>embedded</DebugType>
   </PropertyGroup>
 
 </Project>

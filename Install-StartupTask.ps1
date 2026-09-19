@@ -1,16 +1,26 @@
+param(
+    # Path to AcerInputFix.exe. Defaults to the exe beside this script.
+    [string]$ExePath = ""
+)
+
 $ErrorActionPreference = "Stop"
 
 $TaskName = "AcerInputFix"
-$Exe = Join-Path $PSScriptRoot "AcerInputFix.exe"
 
-if (-not (Test-Path $Exe)) {
-    throw "AcerInputFix.exe not found at $Exe"
+if ([string]::IsNullOrWhiteSpace($ExePath)) {
+    $ExePath = Join-Path $PSScriptRoot "AcerInputFix.exe"
+}
+
+$ExePath = [System.IO.Path]::GetFullPath($ExePath)
+
+if (-not (Test-Path -LiteralPath $ExePath)) {
+    throw "AcerInputFix.exe not found at $ExePath"
 }
 
 $User = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 $Action = New-ScheduledTaskAction `
-    -Execute $Exe
+    -Execute $ExePath
 
 $Trigger = New-ScheduledTaskTrigger `
     -AtLogOn `
@@ -40,5 +50,6 @@ Register-ScheduledTask `
 
 Write-Host ""
 Write-Host "AcerInputFix startup task installed (RunLevel Highest)."
+Write-Host "Executable: $ExePath"
 Write-Host "It will start elevated when $User signs in (UAC consent may apply once at install)."
 Write-Host "Layer-1: suppress stuck VK_MEDIA_NEXT_TRACK. Layer-2: auto Col07 reset after each repair."
